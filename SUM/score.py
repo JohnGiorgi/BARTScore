@@ -11,7 +11,7 @@ REF_HYPO = read_file_to_list('files/ref_hypo_prompt.txt')
 class Scorer:
     """ Support ROUGE-1,2,L, BERTScore, MoverScore, PRISM, BARTScore """
 
-    def __init__(self, file_path, device='cuda:0', multi_ref=False):
+    def __init__(self, file_path, device='cuda:0', multi_ref=False, ref_agg="max"):
         """ file_path: path to the pickle file
             All the data are normal capitalized, and tokenized, including src, ref_summ, ref_summs, and sys_summ.
         """
@@ -28,7 +28,8 @@ class Scorer:
         else:
             self.multi_ref_lines = self.get_multi_ref_lines()
             self.ref_num = len(self.multi_ref_lines[0])
-            print(f'In a multi-reference setting.')
+            self.ref_agg = ref_agg
+            print(f'In a multi-reference setting with aggregation strategy "{self.ref_agg}"')
 
     def get_sys_names(self):
         first_id = list(self.data.keys())[0]
@@ -88,10 +89,16 @@ class Scorer:
                         for i in range(self.ref_num):
                             ref_list = [x[i] for x in ref_lines]
                             curr_P, curr_R, curr_F = bert_scorer.score(sys_lines, ref_list)
-                            P += curr_P.numpy()
-                            R += curr_R.numpy()
-                            F += curr_F.numpy()
-                        P, R, F = P / self.ref_num, R / self.ref_num, F / self.ref_num
+                            if self.ref_agg == "mean":
+                                P += curr_P.numpy()
+                                R += curr_R.numpy()
+                                F += curr_F.numpy()
+                            else:
+                                P = np.maximum(curr_P.numpy(), P)
+                                R = np.maximum(curr_R.numpy(), R)
+                                F = np.maximum(curr_F.numpy(), F)
+                        if self.ref_agg == "mean":
+                            P, R, F = P / self.ref_num, R / self.ref_num, F / self.ref_num
                     counter = 0
                     for doc_id in self.data:
                         self.data[doc_id]['sys_summs'][sys_name]['scores'].update({
@@ -136,8 +143,12 @@ class Scorer:
                             curr_scores = word_mover_score(ref_list, sys_lines, idf_refs, self.idf_hyps,
                                                            self.stop_words, n_gram=1, remove_subwords=True,
                                                            batch_size=48, device=self.device)
-                            scores += np.array(curr_scores)
-                        scores = scores / self.ref_num
+                            if self.ref_agg == "mean":
+                                scores += np.array(curr_scores)
+                            else:
+                                scores = np.maximum(np.array(curr_scores), scores)
+                        if self.ref_agg == "mean":
+                            scores = scores / self.ref_num
                     counter = 0
                     for doc_id in self.data:
                         self.data[doc_id]['sys_summs'][sys_name]['scores']['mover_score'] = scores[counter]
@@ -195,9 +206,14 @@ class Scorer:
                             rouge1_scores.append(r1)
                             rouge2_scores.append(r2)
                             rougel_scores.append(rl)
-                        rouge1_scores = np.mean(rouge1_scores, axis=0)
-                        rouge2_scores = np.mean(rouge2_scores, axis=0)
-                        rougel_scores = np.mean(rougel_scores, axis=0)
+                        if self.ref_agg == "mean":
+                            rouge1_scores = np.mean(rouge1_scores, axis=0)
+                            rouge2_scores = np.mean(rouge2_scores, axis=0)
+                            rougel_scores = np.mean(rougel_scores, axis=0)
+                        else:
+                            rouge1_scores = np.max(rouge1_scores, axis=0)
+                            rouge2_scores = np.max(rouge2_scores, axis=0)
+                            rougel_scores = np.max(rougel_scores, axis=0)
 
                     counter = 0
                     for doc_id in self.data:
@@ -295,15 +311,25 @@ class Scorer:
                         ref_hypo = np.array(bart_scorer.score(ref_lines, sys_lines, batch_size=4))
                         hypo_ref = np.array(bart_scorer.score(sys_lines, ref_lines, batch_size=4))
                     else:
-                        ref_hypo, hypo_ref = np.zeros(len(sys_lines)), np.zeros(len(sys_lines))
+                        if self.ref_agg == "mean":
+                            ref_hypo, hypo_ref = np.zeros(len(sys_lines)), np.zeros(len(sys_lines))
+                        else:
+                            ref_hypo, hypo_ref = np.empty(len(sys_lines)), np.empty(len(sys_lines))
+                            ref_hypo.fill(-100)
+                            hypo_ref.fill(-100)
                         for i in range(self.ref_num):
                             ref_list = [x[i] for x in ref_lines]
                             curr_ref_hypo = np.array(bart_scorer.score(ref_list, sys_lines, batch_size=4))
                             curr_hypo_ref = np.array(bart_scorer.score(sys_lines, ref_list, batch_size=4))
-                            ref_hypo += curr_ref_hypo
-                            hypo_ref += curr_hypo_ref
-                        ref_hypo = ref_hypo / self.ref_num
-                        hypo_ref = hypo_ref / self.ref_num
+                            if self.ref_agg == "mean":
+                                ref_hypo += curr_ref_hypo
+                                hypo_ref += curr_hypo_ref
+                            else:
+                                ref_hypo = np.maximum(curr_ref_hypo, ref_hypo)
+                                hypo_ref = np.maximum(curr_hypo_ref, hypo_ref)
+                        if self.ref_agg == "mean":
+                            ref_hypo = ref_hypo / self.ref_num
+                            hypo_ref = hypo_ref / self.ref_num
                     avg_f = (ref_hypo + hypo_ref) / 2
                     harm_f = (ref_hypo * hypo_ref) / (ref_hypo + hypo_ref)
                     counter = 0
